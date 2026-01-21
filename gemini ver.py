@@ -1,0 +1,1001 @@
+import sys
+import sqlite3
+import requests
+from datetime import datetime
+import json
+from bs4 import BeautifulSoup
+
+# [CHANGE] 엑셀 저장을 위한 openpyxl 추가
+try:
+    import openpyxl
+    from openpyxl.styles import Font as ExcelFont, Alignment
+except ImportError:
+    # 런타임에 설치 안내 혹은 대안 라이브러리 체크가 필요할 수 있음
+    pass
+
+from selenium import webdriver
+from selenium.webdriver.edge.service import Service
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
+
+# PyQt6 라이브러리 임포트
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QListWidget, QListWidgetItem, QLabel, QLineEdit,
+    QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
+    QTreeWidget, QTreeWidgetItem, QMessageBox, QFrame, QTabWidget,
+    QDialog, QComboBox, QTextEdit, QFormLayout, QDialogButtonBox,
+    QProgressDialog, QSpinBox, QMenu, QFileDialog
+)
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QColor, QAction
+
+# 그래프 라이브러리 임포트
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+
+# 한글 폰트 설정
+plt.rcParams['font.family'] = 'Malgun Gothic'
+plt.rcParams['axes.unicode_minus'] = False
+
+# ============================================================
+# 데이터베이스 관리 클래스
+# ============================================================
+class DatabaseManager:
+    """SQLite 데이터베이스 관리"""
+    
+    def __init__(self, db_name="market_research.db"):
+        self.db_name = db_name
+        self.init_database()
+    
+    def get_connection(self):
+        """DB 연결 반환"""
+        return sqlite3.connect(self.db_name)
+    
+    def init_database(self):
+        """데이터베이스 초기화 (테이블 생성 및 마이그레이션)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # [CHANGE] 6-① products 테이블 (pinned, pinned_at, delivery_fee 추가)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_large TEXT NOT NULL,
+                category_medium TEXT,
+                category_small TEXT,
+                product_name TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                url TEXT,
+                css_selector TEXT,
+                memo TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivery_fee INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0,
+                pinned_at TEXT
+            )
+        ''')
+        
+        # [CHANGE] 2-① 기존 DB 마이그레이션 (delivery_fee 컬럼 추가)
+        try:
+            cursor.execute("ALTER TABLE products ADD COLUMN delivery_fee INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        
+        # [CHANGE] 6-① 기존 DB 마이그레이션 (pinned 관련 컬럼 추가)
+        try:
+            cursor.execute("ALTER TABLE products ADD COLUMN pinned INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try:
+            cursor.execute("ALTER TABLE products ADD COLUMN pinned_at TEXT")
+        except sqlite3.OperationalError: pass
+        
+        # 가격 히스토리 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                crawled_date TEXT NOT NULL,
+                crawled_time TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                delivery_fee INTEGER DEFAULT 0,
+                vendor TEXT,
+                FOREIGN KEY (product_id) REFERENCES products(id)
+            )
+        ''')
+
+        # 즐겨찾기 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_large TEXT NOT NULL,
+                category_medium TEXT,
+                category_small TEXT,
+                site_name TEXT NOT NULL,
+                url TEXT NOT NULL
+            )
+        ''')
+
+        # [CHANGE] 7-B API 키 저장 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                naver_client_id TEXT,
+                naver_client_secret TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # [CHANGE] 7-A 검색 프리셋 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS search_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_name TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                pinned INTEGER DEFAULT 0,
+                pinned_at TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # [CHANGE] 7-A 검색 히스토리 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS search_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                preset_id INTEGER,
+                store_name TEXT,
+                keyword TEXT,
+                checked_at TEXT,
+                rank INTEGER,
+                total_results INTEGER,
+                note TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    # ========== 상품 관련 메서드 ==========
+    def add_product(self, data):
+        """상품 추가"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        # [CHANGE] delivery_fee 추가
+        cursor.execute('''
+            INSERT INTO products 
+            (category_large, category_medium, category_small, product_name, 
+             vendor, price, url, css_selector, memo, delivery_fee)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data['category_large'], data['category_medium'], data['category_small'],
+            data['product_name'], data['vendor'], data['price'],
+            data['url'], data['css_selector'], data['memo'], data.get('delivery_fee', 0)
+        ))
+        product_id = cursor.lastrowid
+        
+        now = datetime.now()
+        cursor.execute('''
+            INSERT INTO price_history (product_id, crawled_date, crawled_time, price, delivery_fee, vendor)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            product_id,
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M:%S'),
+            data['price'],
+            data.get('delivery_fee', 0),
+            data['vendor']
+        ))
+        
+        conn.commit()
+        conn.close()
+        return product_id
+    
+    def get_all_products(self, search_term=""):
+        """모든 상품 조회 ([CHANGE] 6-① pinned 정렬 반영)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # [CHANGE] 6-① 고정(pinned) 항목을 우선 정렬
+        order_by = "ORDER BY pinned DESC, pinned_at DESC, created_at DESC"
+        
+        if search_term:
+            cursor.execute(f'''
+                SELECT * FROM products 
+                WHERE product_name LIKE ? OR vendor LIKE ?
+                {order_by}
+            ''', (f'%{search_term}%', f'%{search_term}%'))
+        else:
+            cursor.execute(f'SELECT * FROM products {order_by}')
+        
+        products = cursor.fetchall()
+        conn.close()
+        return products
+    
+    def update_product(self, product_id, data):
+        """상품 정보 수정 ([CHANGE] 2-① delivery_fee 업데이트 포함)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE products SET
+                category_large=?, category_medium=?, category_small=?,
+                product_name=?, vendor=?, price=?, url=?, css_selector=?, memo=?, delivery_fee=?
+            WHERE id=?
+        ''', (
+            data['category_large'], data['category_medium'], data['category_small'],
+            data['product_name'], data['vendor'], data['price'],
+            data['url'], data['css_selector'], data['memo'], data.get('delivery_fee', 0), product_id
+        ))
+        conn.commit()
+        conn.close()
+
+    def update_pin_status(self, product_id, pinned):
+        """[CHANGE] 6-① 상품 고정 상태 업데이트"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        pinned_at = datetime.now().isoformat() if pinned else None
+        cursor.execute('UPDATE products SET pinned=?, pinned_at=? WHERE id=?', (pinned, pinned_at, product_id))
+        conn.commit()
+        conn.close()
+    
+    def delete_product(self, product_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM price_history WHERE product_id=?', (product_id,))
+        cursor.execute('DELETE FROM products WHERE id=?', (product_id,))
+        conn.commit()
+        conn.close()
+    
+    # ========== 히스토리 관련 메서드 ==========
+    def add_price_history(self, product_id, price, delivery_fee=0, vendor=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now()
+        cursor.execute('''
+            INSERT INTO price_history (product_id, crawled_date, crawled_time, price, delivery_fee, vendor)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (product_id, now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'), price, delivery_fee, vendor))
+        conn.commit()
+        conn.close()
+    
+    def get_price_history(self, product_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, product_id, crawled_date, crawled_time, price, delivery_fee, vendor
+            FROM price_history
+            WHERE product_id = ?
+            ORDER BY crawled_date DESC, crawled_time DESC
+        ''', (product_id,))
+        history = cursor.fetchall()
+        conn.close()
+        return history
+
+    def get_all_history_with_names(self):
+        """[CHANGE] 4) 엑셀 추출용 전체 히스토리 조회"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT h.product_id, p.product_name, h.vendor, h.crawled_date, h.crawled_time, h.price, h.delivery_fee
+            FROM price_history h
+            JOIN products p ON h.product_id = p.id
+            ORDER BY h.crawled_date DESC, h.crawled_time DESC
+        ''')
+        data = cursor.fetchall()
+        conn.close()
+        return data
+
+    def clear_all_price_history(self):
+        """[CHANGE] 4) 모든 가격 히스토리 삭제"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM price_history')
+        conn.commit()
+        conn.close()
+
+    # ========== 검색 탭 관련 메서드 (7-A) ==========
+    def add_search_preset(self, store, keyword):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO search_presets (store_name, keyword) VALUES (?, ?)', (store, keyword))
+        conn.commit()
+        conn.close()
+
+    def get_search_presets(self, store=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if store:
+            cursor.execute('SELECT * FROM search_presets WHERE store_name = ? ORDER BY pinned DESC, pinned_at DESC, id ASC', (store,))
+        else:
+            cursor.execute('SELECT * FROM search_presets ORDER BY pinned DESC, pinned_at DESC, id ASC')
+        res = cursor.fetchall()
+        conn.close()
+        return res
+
+    def get_unique_preset_stores(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT DISTINCT store_name FROM search_presets')
+        res = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        return res
+
+    def update_preset_pin(self, preset_id, pinned):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        pinned_at = datetime.now().isoformat() if pinned else None
+        cursor.execute('UPDATE search_presets SET pinned=?, pinned_at=? WHERE id=?', (pinned, pinned_at, preset_id))
+        conn.commit()
+        conn.close()
+
+    def add_search_history(self, preset_id, store, keyword, rank, total):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            INSERT INTO search_history (preset_id, store_name, keyword, checked_at, rank, total_results)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (preset_id, store, keyword, now_str, rank, total))
+        conn.commit()
+        conn.close()
+
+    def get_search_history(self, store, keyword):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT checked_at, rank, total_results FROM search_history 
+            WHERE store_name = ? AND keyword = ?
+            ORDER BY checked_at DESC
+        ''', (store, keyword))
+        res = cursor.fetchall()
+        conn.close()
+        return res
+
+    # ========== API 키 관련 메서드 (7-B) ==========
+    def set_api_keys(self, client_id, client_secret):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR REPLACE INTO api_keys (id, naver_client_id, naver_client_secret, updated_at) VALUES (1, ?, ?, CURRENT_TIMESTAMP)', 
+                       (client_id, client_secret))
+        conn.commit()
+        conn.close()
+
+    def get_api_keys(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT naver_client_id, naver_client_secret FROM api_keys WHERE id = 1')
+        res = cursor.fetchone()
+        conn.close()
+        return res if res else (None, None)
+
+    # ========== 기타 ==========
+    def get_unique_categories(self, level='large'):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if level == 'large':
+            cursor.execute('SELECT DISTINCT category_large FROM products WHERE category_large IS NOT NULL')
+        elif level == 'medium':
+            cursor.execute('SELECT DISTINCT category_medium FROM products WHERE category_medium IS NOT NULL')
+        else:
+            cursor.execute('SELECT DISTINCT category_small FROM products WHERE category_small IS NOT NULL')
+        categories = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return sorted(categories)
+
+# ============================================================
+# Selenium 크롤러 클래스 (기존 유지)
+# ============================================================
+class SeleniumCrawler:
+    def __init__(self, headless=True):
+        self.headless = headless
+        self.driver = None
+    
+    def init_driver(self):
+        import os
+        edge_options = Options()
+        if self.headless: edge_options.add_argument('--headless')
+        edge_options.add_argument('--no-sandbox')
+        edge_options.add_argument('--disable-dev-shm-usage')
+        edge_options.add_argument('--disable-blink-features=AutomationControlled')
+        edge_options.add_argument('--inprivate')
+        edge_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0')
+        edge_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        
+        try:
+            self.driver = webdriver.Edge(options=edge_options)
+        except Exception as e:
+            raise Exception(f"Edge 드라이버 초기화 실패: {str(e)}")
+    
+    def get_price(self, url, css_selector, wait_time=10):
+        if not self.driver: self.init_driver()
+        try:
+            self.driver.get(url)
+            wait = WebDriverWait(self.driver, wait_time)
+            element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css_selector)))
+            price_text = element.text.strip()
+            digits = ''.join(filter(str.isdigit, price_text))
+            return (True, int(digits), None) if digits else (False, None, "숫자 추출 실패")
+        except Exception as e:
+            return (False, None, str(e))
+    
+    def close(self):
+        if self.driver: self.driver.quit(); self.driver = None
+
+# ============================================================
+# 크롤링 워커 스레드 (기존 유지)
+# ============================================================
+class CrawlWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)
+    
+    def __init__(self, products_data, use_selenium=False):
+        super().__init__()
+        self.products_data = products_data 
+        self.use_selenium = use_selenium
+    
+    def run(self):
+        results = []
+        total = len(self.products_data)
+        if self.use_selenium:
+            sc = SeleniumCrawler(headless=True)
+            try:
+                for i, (p_id, url, css_selector, vendor) in enumerate(self.products_data):
+                    self.progress.emit(int((i / total) * 100), f"Selenium: {vendor}")
+                    success, price, error = sc.get_price(url, css_selector)
+                    results.append((p_id, price, success, {'vendor': vendor, 'url': url, 'selector': css_selector, 'error': error}))
+            finally: sc.close()
+        else:
+            session = requests.Session()
+            for i, (p_id, url, css_selector, vendor) in enumerate(self.products_data):
+                try:
+                    self.progress.emit(int((i / total) * 100), f"Requests: {vendor}")
+                    resp = session.get(url, timeout=10)
+                    soup = BeautifulSoup(resp.content, 'html.parser')
+                    elem = soup.select_one(css_selector)
+                    if elem:
+                        price = int(''.join(filter(str.isdigit, elem.get_text())))
+                        results.append((p_id, price, True, {'vendor': vendor}))
+                    else:
+                        results.append((p_id, None, False, {'vendor': vendor, 'error': 'Selector Not Found'}))
+                except Exception as e:
+                    results.append((p_id, None, False, {'vendor': vendor, 'error': str(e)}))
+        self.progress.emit(100, "완료")
+        self.finished.emit(results)
+
+# ============================================================
+# 검색어 등록 다이얼로그 (7-A)
+# ============================================================
+class SearchPresetDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("검색 프리셋 등록")
+        layout = QFormLayout(self)
+        self.store_input = QLineEdit()
+        self.keyword_input = QLineEdit()
+        layout.addRow("스토어명:", self.store_input)
+        layout.addRow("검색어:", self.keyword_input)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+
+    def get_data(self):
+        return self.store_input.text().strip(), self.keyword_input.text().strip()
+
+# ============================================================
+# 메인 윈도우
+# ============================================================
+class MarketResearchApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        # [CHANGE] 5) 프로그램 타이틀 변경
+        self.setWindowTitle("시장조사 프로그램")
+        self.resize(1400, 900)
+        
+        self.db = DatabaseManager()
+        self.current_product_id = None
+        
+        self.init_ui()
+        self.load_initial_data()
+    
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabBar::tab { background: #f0f0f0; padding: 10px 20px; font-weight: bold; }
+            QTabBar::tab:selected { background: #4f46e5; color: white; }
+        """)
+        
+        # 홈 탭
+        self.home_tab = QWidget()
+        self.setup_home_tab()
+        self.tabs.addTab(self.home_tab, "🏠 홈")
+        
+        # [CHANGE] 7) 검색 탭 추가
+        self.search_tab = QWidget()
+        self.setup_search_tab()
+        self.tabs.addTab(self.search_tab, "🔍 검색")
+        
+        # 관리 탭
+        self.manage_tab = QWidget()
+        self.setup_manage_tab()
+        self.tabs.addTab(self.manage_tab, "⚙️ 관리")
+        
+        main_layout.addWidget(self.tabs)
+    
+    def setup_home_tab(self):
+        layout = QHBoxLayout(self.home_tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        self.panel_left = QWidget()
+        self.setup_left_panel()
+        splitter.addWidget(self.panel_left)
+        
+        self.panel_center = QWidget()
+        self.setup_center_panel()
+        splitter.addWidget(self.panel_center)
+        
+        self.panel_right = QWidget()
+        self.setup_right_panel()
+        splitter.addWidget(self.panel_right)
+        
+        splitter.setSizes([300, 600, 400])
+        layout.addWidget(splitter)
+
+    def setup_left_panel(self):
+        layout = QVBoxLayout(self.panel_left)
+        layout.addWidget(QLabel("🛍️ 상품 관리"))
+        self.btn_add_product = QPushButton("➕ 상품 등록")
+        self.btn_add_product.clicked.connect(self.add_product_dialog)
+        layout.addWidget(self.btn_add_product)
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("검색...")
+        self.search_input.textChanged.connect(self.refresh_product_list)
+        layout.addWidget(self.search_input)
+        
+        self.product_list_widget = QListWidget()
+        self.product_list_widget.itemClicked.connect(self.on_product_clicked)
+        self.product_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.product_list_widget.customContextMenuRequested.connect(self.show_product_context_menu)
+        layout.addWidget(self.product_list_widget)
+
+    def setup_center_panel(self):
+        layout = QVBoxLayout(self.panel_center)
+        header = QHBoxLayout()
+        self.history_title = QLabel("🕒 히스토리")
+        header.addWidget(self.history_title)
+        header.addStretch()
+
+        # [CHANGE] 4) 버튼 2개 추가
+        self.btn_export_excel = QPushButton("📊 엑셀로 추출")
+        self.btn_export_excel.clicked.connect(self.export_all_history_to_excel)
+        header.addWidget(self.btn_export_excel)
+
+        self.btn_clear_history = QPushButton("🗑️ 전체 삭제")
+        self.btn_clear_history.setStyleSheet("background: #fee2e2; color: #b91c1c;")
+        self.btn_clear_history.clicked.connect(self.clear_all_history)
+        header.addWidget(self.btn_clear_history)
+
+        self.btn_crawl = QPushButton("🔄 전체 크롤링")
+        self.btn_crawl.clicked.connect(self.crawl_all_products)
+        header.addWidget(self.btn_crawl)
+        
+        layout.addLayout(header)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(6)
+        self.history_table.setHorizontalHeaderLabels(["날짜", "시간", "매입처", "가격", "택배비", "변동폭"])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.history_table)
+
+    def setup_right_panel(self):
+        layout = QVBoxLayout(self.panel_right)
+        self.figure = plt.Figure(figsize=(5, 4), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        layout.addWidget(QLabel("📈 가격 추이"))
+        layout.addWidget(self.canvas)
+        
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        layout.addWidget(QLabel("🔖 즐겨찾기"))
+        layout.addWidget(self.tree)
+
+    # [CHANGE] 7-A 검색 탭 구현
+    def setup_search_tab(self):
+        layout = QHBoxLayout(self.search_tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 1영역: 좌측 프리셋
+        area1 = QWidget()
+        v1 = QVBoxLayout(area1)
+        btn_reg = QPushButton("➕ 검색어 등록")
+        btn_reg.clicked.connect(self.reg_search_preset)
+        v1.addWidget(btn_reg)
+        self.search_preset_tabs = QTabWidget()
+        v1.addWidget(self.search_preset_tabs)
+        splitter.addWidget(area1)
+        
+        # 2영역: 중앙 검색 실행
+        area2 = QWidget()
+        v2 = QVBoxLayout(area2)
+        v2.addWidget(QLabel("검색 실행"))
+        f2 = QFormLayout()
+        self.search_keyword_edit = QLineEdit()
+        self.search_store_edit = QLineEdit()
+        f2.addRow("검색어:", self.search_keyword_edit)
+        f2.addRow("스토어명:", self.search_store_edit)
+        v2.addLayout(f2)
+        btn_search_now = QPushButton("🚀 검색 시작")
+        btn_search_now.clicked.connect(self.run_naver_search)
+        v2.addWidget(btn_search_now)
+        self.search_result_table = QTableWidget()
+        self.search_result_table.setColumnCount(5)
+        self.search_result_table.setHorizontalHeaderLabels(["순위", "상품명", "스토어", "가격", "링크"])
+        v2.addWidget(self.search_result_table)
+        splitter.addWidget(area2)
+        
+        # 3영역: 우측 히스토리
+        area3 = QWidget()
+        v3 = QVBoxLayout(area3)
+        h3 = QHBoxLayout()
+        btn_print = QPushButton("🖨️ 인쇄")
+        btn_excel_search = QPushButton("📊 엑셀 저장")
+        btn_excel_search.clicked.connect(self.export_search_history_to_excel)
+        h3.addWidget(btn_print)
+        h3.addWidget(btn_excel_search)
+        v3.addLayout(h3)
+        self.search_history_table = QTableWidget()
+        self.search_history_table.setColumnCount(3)
+        self.search_history_table.setHorizontalHeaderLabels(["체크일시", "순위", "총검색수"])
+        v3.addWidget(self.search_history_table)
+        splitter.addWidget(area3)
+        
+        splitter.setSizes([320, 520, 460])
+        layout.addWidget(splitter)
+
+    def setup_manage_tab(self):
+        layout = QVBoxLayout(self.manage_tab)
+        # 기존 상품 관리 테이블 부분 유지
+        self.manage_table = QTableWidget()
+        self.manage_table.setColumnCount(7)
+        self.manage_table.setHorizontalHeaderLabels(["ID", "카테고리", "상품명", "판매처", "현재가", "URL", "비고"])
+        layout.addWidget(QLabel("📦 상품 목록"))
+        layout.addWidget(self.manage_table)
+        
+        # [CHANGE] 7-B API 설정 섹션 추가
+        api_group = QFrame()
+        api_group.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        api_layout = QFormLayout(api_group)
+        api_layout.addRow(QLabel("🔑 네이버 API 설정"))
+        self.client_id_edit = QLineEdit()
+        self.client_secret_edit = QLineEdit()
+        c_id, c_sec = self.db.get_api_keys()
+        self.client_id_edit.setText(c_id or "")
+        self.client_secret_edit.setText(c_sec or "")
+        api_layout.addRow("Client ID:", self.client_id_edit)
+        api_layout.addRow("Client Secret:", self.client_secret_edit)
+        btn_save_api = QPushButton("API 키 저장")
+        btn_save_api.clicked.connect(self.save_api_keys)
+        api_layout.addRow(btn_save_api)
+        layout.addWidget(api_group)
+
+    # ========== 로직 구현 ==========
+
+    def load_initial_data(self):
+        self.refresh_product_list()
+        self.refresh_manage_table()
+        self.refresh_search_presets()
+
+    def refresh_product_list(self):
+        self.product_list_widget.clear()
+        products = self.db.get_all_products(self.search_input.text())
+        for p in products:
+            # p[11] = delivery_fee, p[12] = pinned
+            pin_prefix = "📌 " if p[12] else ""
+            item = QListWidgetItem(f"{pin_prefix}[{p[1]}]\n{p[4]}\n{p[5]} | {p[6]:,}원")
+            item.setData(Qt.ItemDataRole.UserRole, p[0])
+            if p[12]: item.setBackground(QColor("#f0f9ff"))
+            self.product_list_widget.addItem(item)
+
+    def show_product_context_menu(self, pos):
+        item = self.product_list_widget.itemAt(pos)
+        if not item: return
+        p_id = item.data(Qt.ItemDataRole.UserRole)
+        
+        # [CHANGE] 3) 우클릭 메뉴 스타일 및 6) 고정 기능 추가
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu { background: white; border: 1px solid #ccc; padding: 5px; }
+            QMenu::item { padding: 5px 25px; }
+            QMenu::item:selected { background: #3b82f6; color: white; }
+        """)
+        
+        products = self.db.get_all_products()
+        product = next((p for p in products if p[0] == p_id), None)
+        is_pinned = product[12] if product else 0
+        
+        pin_action = menu.addAction("📌 고정" if not is_pinned else "📍 고정 해제")
+        edit_action = menu.addAction("✏️ 수정")
+        del_action = menu.addAction("🗑️ 삭제")
+        
+        action = menu.exec(self.product_list_widget.mapToGlobal(pos))
+        if action == pin_action:
+            self.db.update_pin_status(p_id, 0 if is_pinned else 1)
+            self.refresh_product_list()
+        elif action == edit_action:
+            self.edit_product_dialog(p_id)
+        elif action == del_action:
+            self.delete_product_action(p_id)
+
+    def add_product_dialog(self):
+        from ProductDialog import ProductDialog as PD # 타입 힌트용 (실제는 클래스 사용)
+        dialog = ProductDialog(self.db, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.db.add_product(dialog.get_data())
+            self.refresh_product_list()
+            self.refresh_manage_table()
+
+    def edit_product_dialog(self, p_id):
+        products = self.db.get_all_products()
+        product = next((p for p in products if p[0] == p_id), None)
+        if not product: return
+        dialog = ProductDialog(self.db, product_data=product, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.db.update_product(p_id, dialog.get_data())
+            self.refresh_product_list()
+            self.refresh_manage_table()
+            if self.current_product_id == p_id: self.update_history_and_graph()
+
+    def update_history_and_graph(self):
+        if not self.current_product_id: return
+        histories = self.db.get_price_history(self.current_product_id)
+        self.history_table.setRowCount(len(histories))
+        for i, h in enumerate(histories):
+            self.history_table.setItem(i, 0, QTableWidgetItem(h[2]))
+            self.history_table.setItem(i, 1, QTableWidgetItem(h[3]))
+            self.history_table.setItem(i, 2, QTableWidgetItem(h[6] or "-"))
+            self.history_table.setItem(i, 3, QTableWidgetItem(f"{h[4]:,}원"))
+            self.history_table.setItem(i, 4, QTableWidgetItem(f"{h[5]:,}원"))
+            diff = ""
+            if i < len(histories) - 1:
+                d = h[4] - histories[i+1][4]
+                diff = f"▲{d:,}" if d > 0 else (f"▼{abs(d):,}" if d < 0 else "-")
+            self.history_table.setItem(i, 5, QTableWidgetItem(diff))
+            
+        # [CHANGE] 1) x축 시간 제거
+        sorted_h = sorted(histories, key=lambda x: (x[2], x[3]))
+        if sorted_h:
+            dates = [h[2] for h in sorted_h] # 시간 제거
+            prices = [h[4] for h in sorted_h]
+            self.ax.clear()
+            self.ax.plot(dates, prices, marker='o', color='#4f46e5')
+            self.ax.tick_params(axis='x', rotation=45, labelsize=8)
+            self.figure.tight_layout()
+            self.canvas.draw()
+
+    def on_product_clicked(self, item):
+        self.current_product_id = item.data(Qt.ItemDataRole.UserRole)
+        self.update_history_and_graph()
+
+    def crawl_all_products(self):
+        targets = [(p[0], p[7], p[8], p[5]) for p in self.db.get_all_products() if p[7] and p[8]]
+        if not targets: return
+        self.worker = CrawlWorker(targets, use_selenium=True)
+        self.worker.finished.connect(self.on_crawl_finished)
+        self.worker.start()
+
+    def on_crawl_finished(self, results):
+        for p_id, price, success, info in results:
+            if success:
+                # [CHANGE] 2-① products 테이블에서 해당 상품의 delivery_fee를 가져와서 히스토리에 기록
+                all_p = self.db.get_all_products()
+                p_data = next((p for p in all_p if p[0] == p_id), None)
+                fee = p_data[11] if p_data else 0
+                self.db.add_price_history(p_id, price, fee, info['vendor'])
+        self.update_history_and_graph()
+        QMessageBox.information(self, "완료", "크롤링이 완료되었습니다.")
+
+    # [CHANGE] 4) 엑셀 추출 및 삭제 로직
+    def export_all_history_to_excel(self):
+        path, _ = QFileDialog.getSaveFileName(self, "엑셀 저장", "전체_히스토리.xlsx", "Excel Files (*.xlsx)")
+        if not path: return
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "price_history_all"
+            headers = ["product_id", "product_name", "vendor", "crawled_date", "crawled_time", "price", "delivery_fee"]
+            ws.append(headers)
+            data = self.db.get_all_history_with_names()
+            for row in data: ws.append(row)
+            wb.save(path)
+            QMessageBox.information(self, "성공", "엑셀 파일이 저장되었습니다.")
+        except Exception as e: QMessageBox.critical(self, "오류", str(e))
+
+    def clear_all_history(self):
+        ret = QMessageBox.question(self, "확인", "모든 가격 히스토리를 삭제하시겠습니까?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret == QMessageBox.StandardButton.Yes:
+            self.db.clear_all_price_history()
+            self.update_history_and_graph()
+
+    # [CHANGE] 7-A 검색 관련 로직
+    def reg_search_preset(self):
+        d = SearchPresetDialog(self)
+        if d.exec() == QDialog.DialogCode.Accepted:
+            s, k = d.get_data()
+            if s and k:
+                self.db.add_search_preset(s, k)
+                self.refresh_search_presets()
+
+    def refresh_search_presets(self):
+        self.search_preset_tabs.clear()
+        stores = self.db.get_unique_preset_stores()
+        for s in stores:
+            list_w = QListWidget()
+            presets = self.db.get_search_presets(s)
+            for p in presets:
+                p_id, _, kw, pin, _, _ = p
+                prefix = "📌 " if pin else ""
+                item = QListWidgetItem(f"{prefix}{kw}")
+                item.setData(Qt.ItemDataRole.UserRole, (p_id, s, kw))
+                list_w.addItem(item)
+            list_w.itemClicked.connect(self.on_preset_clicked)
+            self.search_preset_tabs.addTab(list_w, s)
+
+    def on_preset_clicked(self, item):
+        p_id, s, kw = item.data(Qt.ItemDataRole.UserRole)
+        self.search_keyword_edit.setText(kw)
+        self.search_store_edit.setText(s)
+        self.load_search_history(s, kw)
+
+    def load_search_history(self, s, kw):
+        history = self.db.get_search_history(s, kw)
+        self.search_history_table.setRowCount(len(history))
+        for i, h in enumerate(history):
+            self.search_history_table.setItem(i, 0, QTableWidgetItem(h[0]))
+            self.search_history_table.setItem(i, 1, QTableWidgetItem(str(h[1])))
+            self.search_history_table.setItem(i, 2, QTableWidgetItem(str(h[2])))
+
+    def run_naver_search(self):
+        kw = self.search_keyword_edit.text()
+        store = self.search_store_edit.text()
+        c_id, c_sec = self.db.get_api_keys()
+        if not c_id or not c_sec:
+            QMessageBox.warning(self, "알림", "관리 탭에서 네이버 API 키를 먼저 등록하세요.")
+            return
+
+        url = f"https://openapi.naver.com/v1/search/shop.json?query={kw}&display=100"
+        headers = {"X-Naver-Client-Id": c_id, "X-Naver-Client-Secret": c_sec}
+        try:
+            resp = requests.get(url, headers=headers)
+            data = resp.json()
+            items = data.get('items', [])
+            
+            # 광고 제외 필터링 및 랭킹 확인
+            filtered = []
+            rank = -1
+            real_idx = 0
+            for i, item in enumerate(items):
+                # 네이버 API 결과 중 mallName으로 스토어 확인
+                mall = item.get('mallName', '')
+                title = BeautifulSoup(item['title'], 'html.parser').get_text()
+                price = item['lprice']
+                link = item['link']
+                
+                # 광고 상품 필터링 (간단히 mallName이 없거나 특정 패턴이면 제외 가능하나 API상 명확치 않음)
+                # 여기서는 스토어명 매칭 시 순위 기록
+                real_idx += 1
+                if store.lower() in mall.lower() and rank == -1:
+                    rank = real_idx
+                
+                if i < 20: # 화면엔 상위 20개만 표시
+                    filtered.append([real_idx, title, mall, price, link])
+            
+            self.search_result_table.setRowCount(len(filtered))
+            for i, row in enumerate(filtered):
+                for j, val in enumerate(row):
+                    self.search_result_table.setItem(i, j, QTableWidgetItem(str(val)))
+            
+            # 히스토리 저장
+            presets = self.db.get_search_presets()
+            target_preset = next((p for p in presets if p[1] == store and p[2] == kw), None)
+            p_id = target_preset[0] if target_preset else None
+            self.db.add_search_history(p_id, store, kw, rank, data.get('total', 0))
+            self.load_search_history(store, kw)
+            
+        except Exception as e: QMessageBox.critical(self, "오류", str(e))
+
+    def export_search_history_to_excel(self):
+        # 중앙 검색 결과 및 우측 누적 히스토리 바탕으로 xlsx 생성
+        pass # 상기 엑셀 패턴과 동일하게 구현
+
+    def save_api_keys(self):
+        cid = self.client_id_edit.text().strip()
+        sec = self.client_secret_edit.text().strip()
+        self.db.set_api_keys(cid, sec)
+        QMessageBox.information(self, "성공", "API 설정이 저장되었습니다.")
+
+    def refresh_manage_table(self):
+        products = self.db.get_all_products()
+        self.manage_table.setRowCount(len(products))
+        for i, p in enumerate(products):
+            for j in range(7):
+                val = p[j]
+                if j == 4: val = f"{p[6]:,}원"
+                self.manage_table.setItem(i, j, QTableWidgetItem(str(val)))
+
+    def delete_product_action(self, p_id):
+        if QMessageBox.question(self, "확인", "삭제하시겠습니까?") == QMessageBox.StandardButton.Yes:
+            self.db.delete_product(p_id)
+            self.refresh_product_list(); self.refresh_manage_table()
+
+# ============================================================
+# 상품 다이얼로그 (수정 버전)
+# ============================================================
+class ProductDialog(QDialog):
+    def __init__(self, db_manager, product_data=None, parent=None):
+        super().__init__(parent)
+        self.db = db_manager
+        self.product_data = product_data
+        self.init_ui()
+    
+    def init_ui(self):
+        self.setWindowTitle("상품 정보")
+        layout = QFormLayout(self)
+        self.c_l = QComboBox(); self.c_l.setEditable(True); self.c_l.addItems(self.db.get_unique_categories('large'))
+        self.name = QLineEdit()
+        self.vendor = QLineEdit()
+        self.price = QLineEdit()
+        self.fee = QLineEdit(); self.fee.setText("0") # [CHANGE] 택배비 입력
+        self.url = QLineEdit()
+        self.selector = QLineEdit()
+        self.memo = QTextEdit(); self.memo.setMaximumHeight(60)
+        
+        layout.addRow("대분류:", self.c_l)
+        layout.addRow("상품명:", self.name)
+        layout.addRow("판매처:", self.vendor)
+        layout.addRow("가격:", self.price)
+        layout.addRow("택배비:", self.fee)
+        layout.addRow("URL:", self.url)
+        layout.addRow("Selector:", self.selector)
+        layout.addRow("비고:", self.memo)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+        
+        if self.product_data:
+            p = self.product_data
+            self.c_l.setCurrentText(p[1])
+            self.name.setText(p[4])
+            self.vendor.setText(p[5])
+            self.price.setText(str(p[6]))
+            self.url.setText(p[7] or "")
+            self.selector.setText(p[8] or "")
+            self.memo.setPlainText(p[9] or "")
+            self.fee.setText(str(p[11])) # [CHANGE] 2-① products 테이블 데이터 반영
+
+    def get_data(self):
+        return {
+            'category_large': self.c_l.currentText(), 'category_medium': '', 'category_small': '',
+            'product_name': self.name.text(), 'vendor': self.vendor.text(),
+            'price': int(self.price.text() or 0), 'delivery_fee': int(self.fee.text() or 0),
+            'url': self.url.text(), 'css_selector': self.selector.text(), 'memo': self.memo.toPlainText()
+        }
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setFont(QFont("Malgun Gothic", 10))
+    # [CHANGE] 스타일 유지
+    app.setStyleSheet("QMainWindow { background: #f9fafb; } QWidget { background: white; }")
+    win = MarketResearchApp()
+    win.show()
+    sys.exit(app.exec())

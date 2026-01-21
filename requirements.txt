@@ -1,0 +1,28 @@
+# 시장 조사 애플리케이션 필수 패키지
+
+# GUI 프레임워크
+PyQt6==6.7.0
+PyQt6-WebEngine==6.7.0
+
+# 웹 크롤링 (범용 브라우저 지원)
+selenium==4.26.1
+webdriver-manager==4.0.2
+
+# HTML 파싱
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# HTTP 요청
+requests==2.32.3
+
+# 엑셀 처리
+openpyxl==3.1.5
+
+# 데이터 시각화
+matplotlib==3.9.2
+
+# 데이터베이스 (Python 기본 제공이지만 명시)
+# sqlite3는 Python 기본 라이브러리이므로 별도 설치 불필요
+
+# 기타 유틸리티
+python-dateutil==2.9.0
