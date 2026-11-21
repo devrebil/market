@@ -4,3 +4,5 @@ dist/
 *.exe
 *.pkg
 *.spec
+# DB 파일 무시하기 (API 키 등 민감정보 포함)
+*.db
